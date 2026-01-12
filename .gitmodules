@@ -1,0 +1,3 @@
+[submodule "flashrom"]
+	path = flashrom
+	url = https://github.com/flashrom/flashrom.git

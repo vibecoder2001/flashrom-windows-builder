@@ -1,0 +1,88 @@
+name: Nightly bump flashrom submodule to latest commit
+
+on:
+  schedule:
+    - cron: "17 3 * * *"
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+concurrency:
+  group: bump-flashrom
+  cancel-in-progress: true
+
+jobs:
+  bump:
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+          submodules: false
+
+      - name: Ensure up-to-date main
+        run: |
+          set -euo pipefail
+          git fetch origin main
+          git switch main
+          git pull --ff-only origin main
+
+      - name: Init submodules
+        run: |
+          set -euo pipefail
+          git submodule sync --recursive
+          git submodule update --init --recursive
+
+      - name: Configure git identity
+        run: |
+          git config user.name  "flashrom-nightly-bot"
+          git config user.email "flashrom-nightly-bot@users.noreply.github.com"
+
+      - name: Update flashrom submodule to upstream HEAD
+        id: bump
+        run: |
+          set -euo pipefail
+
+          test -d flashrom || (echo "flashrom submodule directory missing"; exit 1)
+
+          # Fetch remote refs (including origin/HEAD)
+          git -C flashrom fetch origin --prune --force
+
+          # Resolve upstream default branch ref (origin/HEAD -> origin/main etc.)
+          UPSTREAM_HEAD_REF="$(git -C flashrom symbolic-ref -q refs/remotes/origin/HEAD || true)"
+          if [ -z "$UPSTREAM_HEAD_REF" ]; then
+            echo "Could not resolve refs/remotes/origin/HEAD; falling back to origin/main" >&2
+            UPSTREAM_HEAD_REF="refs/remotes/origin/main"
+          fi
+
+          CURRENT_SUBMODULE_COMMIT="$(git submodule status flashrom | awk '{print $1}' | sed 's/^-//')"
+          TARGET_COMMIT="$(git -C flashrom rev-parse "$UPSTREAM_HEAD_REF")"
+
+          echo "Current submodule commit: $CURRENT_SUBMODULE_COMMIT"
+          echo "Upstream HEAD ref:        $UPSTREAM_HEAD_REF"
+          echo "Target upstream commit:   $TARGET_COMMIT"
+
+          if [ "$CURRENT_SUBMODULE_COMMIT" = "$TARGET_COMMIT" ]; then
+            echo "Already at latest upstream commit. No update."
+            echo "changed=false" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+
+          git -C flashrom checkout --detach "$TARGET_COMMIT"
+          git add flashrom
+          git commit -m "Bump flashrom submodule to ${TARGET_COMMIT:0:12}"
+
+          echo "changed=true" >> "$GITHUB_OUTPUT"
+          echo "target_commit=${TARGET_COMMIT}" >> "$GITHUB_OUTPUT"
+
+      - name: Push autobump branch
+        if: steps.bump.outputs.changed == 'true'
+        env:
+          BRANCH: autobump/flashrom
+        run: |
+          set -euo pipefail
+          git switch -C "$BRANCH"
+          git push origin "$BRANCH" --force-with-lease

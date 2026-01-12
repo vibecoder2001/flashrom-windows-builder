@@ -1,0 +1,116 @@
+name: Build Windows (after bump)
+
+on:
+  workflow_run:
+    workflows: ["Nightly bump flashrom submodule to latest commit"]
+    types:
+      - completed
+
+permissions:
+  contents: write
+
+concurrency:
+  group: build-windows-after-bump
+  cancel-in-progress: true
+
+jobs:
+  build:
+    if: ${{ github.event.workflow_run.conclusion == 'success' }}
+    runs-on: windows-latest
+
+    steps:
+      - name: Checkout autobump branch (with submodules)
+        uses: actions/checkout@v4
+        with:
+          ref: autobump/flashrom
+          submodules: recursive
+          fetch-depth: 0
+
+      - name: Install MSYS2 (MINGW64)
+        uses: msys2/setup-msys2@v2
+        with:
+          msystem: MINGW64
+          update: true
+          install: >-
+            git
+            mingw-w64-x86_64-toolchain
+            mingw-w64-x86_64-meson
+            mingw-w64-x86_64-ninja
+            mingw-w64-x86_64-pkg-config
+            mingw-w64-x86_64-libusb
+            mingw-w64-x86_64-ntldd-git
+            zip
+
+      - name: Build
+        shell: msys2 {0}
+        run: |
+          set -eux
+          bash scripts/build_msys2.sh
+
+      - name: Package
+        id: pkg
+        shell: msys2 {0}
+        run: |
+          set -eux
+          ZIP_POSIX="$(bash scripts/package.sh | tail -n 1)"
+          ZIP_WIN="$(cygpath -w "$ZIP_POSIX")"
+          echo "zip_path=$ZIP_WIN" >> "$GITHUB_OUTPUT"
+          echo "Packaged: $ZIP_WIN"
+
+      - name: Upload artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: flashrom-windows
+          path: ${{ steps.pkg.outputs.zip_path }}
+
+      # --- OPTIONAL: cut/update a GitHub Release here too ---
+      - name: Compute release tag (from flashrom submodule commit)
+        id: rel
+        shell: pwsh
+        run: |
+          $commitShort = (git -C flashrom rev-parse --short=12 HEAD).Trim()
+          $commitFull  = (git -C flashrom rev-parse HEAD).Trim()
+
+          $tag = "flashrom-$commitShort"
+          $title = "flashrom Windows build ($commitShort)"
+          $body = @"
+          Automated Windows build of flashrom.
+
+          Upstream commit: $commitFull
+          "@
+
+          "tag=$tag" | Out-File -FilePath $env:GITHUB_OUTPUT -Append
+          "title=$title" | Out-File -FilePath $env:GITHUB_OUTPUT -Append
+          "body<<EOF" | Out-File -FilePath $env:GITHUB_OUTPUT -Append
+          $body | Out-File -FilePath $env:GITHUB_OUTPUT -Append
+          "EOF" | Out-File -FilePath $env:GITHUB_OUTPUT -Append
+
+      - name: Create or update GitHub Release
+        shell: pwsh
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          REPO: ${{ github.repository }}
+        run: |
+          $tag   = "${{ steps.rel.outputs.tag }}"
+          $title = "${{ steps.rel.outputs.title }}"
+          $zip   = "${{ steps.pkg.outputs.zip_path }}"
+          $body  = "${{ steps.rel.outputs.body }}"
+
+          # Make sure gh is authenticated (token provided via env)
+          gh auth status --hostname github.com
+
+          # Check if release exists (no exceptions, just exit code)
+          gh release view $tag --repo $env:REPO *> $null
+          $exists = ($LASTEXITCODE -eq 0)
+
+          if (-not $exists) {
+            gh release create $tag `
+              --repo $env:REPO `
+              --title "$title" `
+              --notes "$body" `
+              --prerelease `
+              "$zip"
+          } else {
+            gh release edit $tag --repo $env:REPO --title "$title" --notes "$body"
+            gh release upload $tag --repo $env:REPO "$zip" --clobber
+          }
